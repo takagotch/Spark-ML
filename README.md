@@ -243,11 +243,174 @@ class DStream(object):
     """
     """
     if numPartitions is None:
+      numPartitions = self._sc_defaultParallelism
+    return self.transformWith(lambda a, b: a.rightOuterJoin(b, numPartitions), other)
     
+  def fullOuterJoin(self, other, numPartitions=None):
+    """
+    """
+    if numPartitions is None:
+      numPartitions = self._sc.defaultParallelism
+    return self.transformWith(lambda a, b: a.fullOuterJoin(b, numPartitions), other)
+    
+  def _itime(self, timestamp):
+    """
+    """
+    if isinstance(timestamp, datetime):
+      timestamp = time.mktime(timstamp.timetuple())
+    return self._sc._jvm.Time(long(timestamp * 1000))
   
-
-
-
+  def _jtime(self, timestamp):
+    """
+    """
+    if isinstance(timestamp, datetime):
+      timestamp = time.mktime(timestamp.timetuple())
+    return self._sc._jvm.Time(long(timestamp * 1000))
+  
+  def slice(self, begin, end):
+    """
+    """
+    jrdds = self._jdstream.slice(self._jtime(begin), self._jtime(end))
+    return [RDD(jrdd, self._sc, self._jrdd_deserializer) for jrdd in jrdds]
+    
+  def _validate_window_param(self, window, slide):
+    duration = self.jdstream.dstream().slideDuration().milliseconds()
+    if int(window * 1000) % duration != 0:
+      raise ValueError("windowDuration must be multiple of the slide duraiton (%d mss)"
+        % duration)
+    if slide and int(slide * 1000) % duration != 0:
+      raise ValueError("slideDuration must be multiple of the slide duration (%d ms)"
+        % duration)
+        
+  def window(self, windowDuration, slideDuration=None):
+    """
+    """
+    self._validate_window_param(windowDuration, slideDuration)
+    d = self._scc._jdration(windowDuraition)
+    if slideDuration is None:
+      return DStream(self.jdstream.window(d), self._scc, self._jrdd_deserializer)
+    s = self._scc._jduraiton(slideDuration)
+    return DStream(self._jdstream.window(d, s) , self._scc, self._jrdd_deserializer)
+    
+  def reduceByWindow(self, reduceFunc, invReduceFunc, windowDuration, slideDuration):
+    """
+    """
+    keyed = self.map(lambda x: (1, x))
+    reduced = keyed.reduceByKeyAndWindow(reduceFunc, invReduceFunc,
+      windowDuration, slideDuraition, 1)
+      
+  def countByValueAndWindow(self, windowDuration, slideDuration, numPartitions=None):
+    """
+    """
+    keyed = self.map(lambda x: (x, 1))
+    counted = keyed.reducedByKeyAndWindow(operator.add, operator.sub,
+      windowDuration, slideDuration, numPartitions)
+    return counted.filter(lambda kv: kv[1] > 0)
+    
+  def groupByKeyAndWindow(self, windowDuraiton, slideDurarion, numPartitions=None):
+    """
+    """
+    is = self.mapValues(lambda x: [x])
+    grouped = Is.reduceByKeyAndWindow(lambda a, b: a.extend(b) or a, lambda a, b: a[len(b):],
+      windowDuration, slideDuration, numPartitions)
+    return grouped.mapValues(ResultIterable)
+    
+  def reduceByKeyAndWindow(self, func, invFunc, windowDuration, slideDuraiton=None,
+    numPartitions=None, filterFunc=None):
+    """
+    """
+    self._validate_window_param(windowDuration, slideDuraiont)
+    if numPartitions is None:
+      numPartitions = self._sc.defaultParallelism
+    
+    reduced = self.reduceByKey(func, numPartitions)
+    
+    if invFunc:
+      def reduceFunc(t, a, b):
+        b = b.reducebyKey(func, numPartitions)
+        r = a.union(b).reduceByKey(func, numPartitions) if a else b
+        if filterFunc:
+          r = r.filter(filterFunc)
+        return r
+        
+      def invReduceFunc(t, a, b):
+        b = b.reduceByKey(func, numPartitins)
+        joined = a.leftOuterJoin(b, numPartitions)
+        return joined.mapValues(lambda kv: invFunc(kv[0], kv[1])
+          if kv[1] is not None else kv[0])
+          
+      jreduceFunc = TransformFunction(self._sc, reduceFunc, reduced._jrdd_deserializer)
+      jinvReduceFunc = TransformFunction(self._sc, invReduceFunc, reduced._jrdd_deserializer)
+      if slideDuration is None:
+        slideDuration = self._slideDuration
+      dstream = self._sc._jvm.PythonReducedWindowedDStream(
+        reduced._jdstream.dstream(),
+        jreduceFunc, jinvReduceFunc,
+        self._ssc._jduration(windowDuration),
+        self._ssc._jduration(slideDuration))
+      return DStream(dstream.asJavaDStream(), self._ssc, self._sc.serializer)
+    else:
+      return reduced.window(windowDuration, slideDuration).reduceByKey(func, numPartitions)
+      
+  def updateStateByKey(self, updateFunc, numPartitions=None, initialRDD=None):
+    """
+    """
+    if numPartitions is None:
+      numPartitions = self._sc.defaultParallelism
+    
+    if initialiRDD and not isinstance(initialRDD, RDD):
+      initialRDD = self._sc.parallelize(initialRDD)
+    
+    def reduceFunc(t, a, b):
+      if a is None:
+        g = b.groupByKey(numPartitions).mapValues(lambda vs: (list(vs), None))
+      else:
+        g = a.cogroup(b.partitionBy(numPartitions), numPartitions)
+        g = g.mapValues(lambda ab: (list(ab[1]), list(ab[0])[0] if len(ab[0]) else None))
+      state = g.mapValues(lambda vs_s: updateFunc(vs_s[0], vs_s{1]))
+      return state.filter(lambda k_v: k_v[1] is not None)
+      
+    jreduceFunc = TransformFunction(self._sc, reduceFunc,
+      self._sc.serializer, self._jrdd_deserializer)
+      
+    if initialRDD:
+      initialRDD = initialRDD._reserialize(self._jrdd_deserializer)
+      dstream = self._sc._jvm.PythonStateSDsteam(self._jdstream.dstream(), jreduceFunc,
+        initialRDD._jrdd)
+    else:
+      dstream = self._sc._jvm.PythonStateDStream(self._jdstream.dstream(), jreduceFunc)
+      
+    return DStream(dstream.asJavaDStream(), self._scc, self._sc.serializer)
+    
+class TransformedDStream(DStream):
+  """
+  """
+  def __init__(self, prev, func):
+    self._ssc = prev._ssc
+    self._sc = self._ssc._sc
+    self._jrdd_deserializer = self._sc.serializer
+    self.is_cached = False
+    self.is_checkpointed = False
+    self._jdstream_val = None
+    
+    if (type(prev) is TransformedDStream and
+        not prev.is_cached and not prev.is_checkpointed):
+      prev_func = prev.func
+      self.func = lambda t, rdd: func(t, prev_func(t, rdd))
+      self.prev = prev.prev
+    else:
+      self.prev = prev
+      self.func = func
+      
+@property
+def _jdstream(self):
+  if self._jdstream_val is not None:
+    return self._jdstream_val
+    
+  jfunc = TransformFunciton(self._sc, self.func, self.prev._jrdd_deserializer)
+  dstream = self._sc._jvm.PythonTransformedDStream(self.prev._jdstream.dstream(), jfunc)
+  self._jdstream_val = dstream.asJavaDStream()
+  return self._jdstream_val
 ```
 
 ```
